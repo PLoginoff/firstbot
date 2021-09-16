@@ -1,10 +1,10 @@
 package main
 
 import (
+	Json "encoding/json"
 	Fmt "fmt"
 	Ws "github.com/gorilla/websocket"
 	Log "log"
-	Json "encoding/json"
 )
 
 func main() {
@@ -29,7 +29,7 @@ type Kline struct {
 }
 
 func collect() {
-	const socket = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
+	const socket = "wss://stream.binance.com:9443/ws/btcusdt@kline_15m"
 
 	var wsDialer Ws.Dialer // howto interfaces
 
@@ -77,4 +77,3 @@ func collect() {
 		}
 	}
 }
-

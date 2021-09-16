@@ -1,5 +1,8 @@
 package main
 
+// добавтиь цикл для переподключения сокетов загрузки стаканов
+
+
 // в параллельном процессе без блокировок обновлять цену каждую секунду
 // цену записывать в кэш, в некое хранилишие по типу рэдиса
 // структура под запись разных значений... как лучше всего парсить JSON сразу в структуру?
@@ -11,6 +14,8 @@ import (
 	Fmt "fmt"
 	Gabs "github.com/Jeffail/gabs"
 	Ws "github.com/gorilla/websocket"
+	Deep "github.com/patrikeh/go-deep"
+	Training "github.com/patrikeh/go-deep/training"
 	Load "github.com/shirou/gopsutil/load"
 	Mem "github.com/shirou/gopsutil/mem"
 	Tg "gopkg.in/tucnak/telebot.v2"
@@ -28,10 +33,14 @@ var usd float32
 const ticker = "https://blockchain.info/ticker"
 
 func main() {
+	const minGap = 0.23
+
 	go updateBook1()
 	go updateBook2()
 	go updateTicket()
-	go findGap(0.2)
+	go findGap(minGap)
+	// ml()
+	// return
 	// printBooks()
 
 	token := Os.Getenv("TELEGRAM")
@@ -156,6 +165,7 @@ type Order struct {
 	Price float64
 	Size  float64
 }
+type OrderBook map[int8]Order
 
 var orderBook1 = make(map[int8]Order)   // bitfinex
 var orderBook2 = make(map[int8]Order)   // binance
@@ -245,65 +255,69 @@ func calcGap(book1 map[int8]Order, book2 map[int8]Order) float64 {
 // bitfinex
 func updateBook1() {
 	var wsDialer Ws.Dialer
-	wsConn, _, err := wsDialer.Dial("wss://api.bitfinex.com/ws/2", nil)
-	if err != nil {
-		println(err.Error())
-	}
-
-	subscribe := map[string]string{
-		"event":   "subscribe",
-		"channel": "book",
-		"symbol":  "tBTCUSD",
-		"prec":    "P0",
-		"freq":    "F0",
-	}
-	if err := wsConn.WriteJSON(subscribe); err != nil {
-		println(err.Error())
-	}
-
-	for {
-		msgType, resp, err := wsConn.ReadMessage()
+	for { // redial todo как это сделать более красиво с этом wsDealler
+		wsConn, _, err := wsDialer.Dial("wss://api.bitfinex.com/ws/2", nil)
 		if err != nil {
-			Fmt.Println(err)
-			break
-		}
-
-		if msgType != Ws.TextMessage {
+			println(err.Error())
 			continue
 		}
 
-		jsonParsed, err := Gabs.ParseJSON(resp)
-		if err != nil {
-			Log.Println(err)
+		subscribe := map[string]string{
+			"event":   "subscribe",
+			"channel": "book",
+			"symbol":  "tBTCUSD",
+			"prec":    "P0",
+			"freq":    "F0",
+		}
+		if err := wsConn.WriteJSON(subscribe); err != nil {
+			println(err.Error())
 			continue
 		}
 
-		exists := jsonParsed.Exists("event")
-		if exists {
-			continue
-		}
+		for {
+			msgType, resp, err := wsConn.ReadMessage()
+			if err != nil {
+				Fmt.Println(err)
+				break
+			}
 
-		row, _ := jsonParsed.Index(1).Children()
-		count := len(row)
-		if count == 3 {
-			row = []*Gabs.Container{jsonParsed.Index(1)}
-		}
-
-		for _, order := range row {
-			if c, _ := order.ArrayCount(); c < 3 {
+			if msgType != Ws.TextMessage {
 				continue
 			}
-			price := order.Index(0).Data().(float64)
-			numOrder := order.Index(1).Data().(float64)
-			size := order.Index(2).Data().(float64)
-			id := int8(numOrder) // 1..5
 
-			if size < 0 { // sell
-				size = 0 - size
-				id = 0 - id
+			jsonParsed, err := Gabs.ParseJSON(resp)
+			if err != nil {
+				Log.Println(err)
+				continue
 			}
 
-			orderBook1[id] = Order{Size: size, Price: price}
+			exists := jsonParsed.Exists("event")
+			if exists {
+				continue
+			}
+
+			row, _ := jsonParsed.Index(1).Children()
+			count := len(row)
+			if count == 3 {
+				row = []*Gabs.Container{jsonParsed.Index(1)}
+			}
+
+			for _, order := range row {
+				if c, _ := order.ArrayCount(); c < 3 {
+					continue
+				}
+				price := order.Index(0).Data().(float64)
+				numOrder := order.Index(1).Data().(float64)
+				size := order.Index(2).Data().(float64)
+				id := int8(numOrder) // 1..5
+
+				if size < 0 { // sell
+					size = 0 - size
+					id = 0 - id
+				}
+
+				orderBook1[id] = Order{Size: size, Price: price}
+			}
 		}
 	}
 }
@@ -313,51 +327,152 @@ func updateBook2() {
 	const socket = "wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms"
 
 	var wsDialer Ws.Dialer // howto interfaces
-	wsConn, _, err := wsDialer.Dial(socket, nil)
-	if err != nil {
-		println(err.Error())
+
+	for { // redial
+		wsConn, _, err := wsDialer.Dial(socket, nil)
+		if err != nil {
+			println(err.Error())
+			continue
+		}
+
+		for {
+			msgType, resp, err := wsConn.ReadMessage()
+			if err != nil {
+				Fmt.Println(err)
+				break
+			}
+
+			if msgType != Ws.TextMessage {
+				Log.Println(msgType)
+				continue
+			}
+
+			jsonParsed, err := Gabs.ParseJSON(resp)
+			if err != nil {
+				Log.Println(err)
+				continue
+			}
+
+			list, err := jsonParsed.Path("bids").Children() // buy
+			if err != nil {
+				Log.Println(string(resp))
+				Log.Println(err.Error())
+				break
+			}
+
+			id := int8(1)
+			for _, order := range list {
+				price, _ := strconv.ParseFloat(order.Index(0).Data().(string), 64)
+				size, _ := strconv.ParseFloat(order.Index(1).Data().(string), 64)
+				orderBook2[id] = Order{Size: size, Price: price}
+				id = id + 1
+			}
+
+			bids, _ := jsonParsed.Path("asks").Children() // sell
+			id = -1
+			for _, order := range bids {
+				price, _ := strconv.ParseFloat(order.Index(0).Data().(string), 64)
+				size, _ := strconv.ParseFloat(order.Index(1).Data().(string), 64)
+				orderBook2[id] = Order{Size: size, Price: price}
+				id = id - 1
+			}
+		}
+	}
+}
+
+/*
+пока алго такой вот:
+ - 20points * 5values = 100 inputs - 1 output
+ - 100, 100, 100, 100
+
+зачем нормализовать?
+ - чтобы можно было применять нейронку к разным парам
+
+
+
+*/
+
+func ml() {
+	n := Deep.NewNeural(&Deep.Config{
+		/* Input dimensionality */
+		Inputs: 100,
+		/* Two hidden layers consisting of two neurons each, and a single output */
+		Layout: []int{100, 100, 1}, // 1000*1000 -> 1
+		/* Activation functions: Sigmoid, Tanh, ReLU, Linear */
+		Activation: Deep.ActivationSigmoid,
+		/* Determines output layer activation & loss function:
+		ModeRegression: linear outputs with MSE loss
+		ModeMultiClass: softmax output with Cross Entropy loss
+		ModeMultiLabel: sigmoid output with Cross Entropy loss
+		ModeBinary: sigmoid output with binary CE loss */
+		Mode: Deep.ModeBinary,
+		/* Weight initializers: {deep.NewNormal(μ, σ), deep.NewUniform(μ, σ)} */
+		Weight: Deep.NewNormal(1.0, 0.0),
+		/* Apply bias */
+		Bias: true,
+	})
+
+	// params: learning rate, momentum, alpha decay, nesterov
+	optimizer := Training.NewSGD(0.05, 0.1, 1e-6, true)
+	// params: optimizer, verbosity (print stats at every 50th iteration)
+	trainer := Training.NewTrainer(optimizer, 100)
+	// trainer := Training.NewBatchTrainer(optimizer, 50, 200, 4)
+
+	Time.Sleep(Time.Second * 5) // wait data...
+
+	prev := make(OrderBook) // prev version
+	max := 25 // points
+	examples := make(Training.Examples, max)
+
+	// train cycle
+
+	Log.Println("Collect data...")
+
+	for k, v := range orderBook2 {
+		prev[k] = v
 	}
 
+	i := 0
 	for {
-		msgType, resp, err := wsConn.ReadMessage()
-		if err != nil {
-			Fmt.Println(err)
+		Time.Sleep(Time.Millisecond * 1000)
+		nextPrice := calcPrice(orderBook2)
+		examples[i] = Training.Example{Input: formatBook(prev), Response: []float64{nextPrice}}
+		if i++; i >= max {
 			break
 		}
-
-		if msgType != Ws.TextMessage {
-			Log.Println(msgType)
-			continue
-		}
-
-		jsonParsed, err := Gabs.ParseJSON(resp)
-		if err != nil {
-			Log.Println(err)
-			continue
-		}
-
-		list, err := jsonParsed.Path("bids").Children() // buy
-		if err != nil {
-			Log.Println(string(resp))
-			Log.Println(err.Error())
-			break
-		}
-
-		id := int8(1)
-		for _, order := range list {
-			price, _ := strconv.ParseFloat(order.Index(0).Data().(string), 64)
-			size, _ := strconv.ParseFloat(order.Index(1).Data().(string), 64)
-			orderBook2[id] = Order{Size: size, Price: price}
-			id = id + 1
-		}
-
-		bids, _ := jsonParsed.Path("asks").Children() // sell
-		id = -1
-		for _, order := range bids {
-			price, _ := strconv.ParseFloat(order.Index(0).Data().(string), 64)
-			size, _ := strconv.ParseFloat(order.Index(1).Data().(string), 64)
-			orderBook2[id] = Order{Size: size, Price: price}
-			id = id - 1
+		Log.Println("Diff:", nextPrice - calcPrice(prev))
+		for k, v := range orderBook2 {
+			prev[k] = v
 		}
 	}
+
+	training, heldout := examples.Split(0.5)
+	trainer.Train(n, training, heldout, 1000) // training, validation, iterations
+
+	i = 0
+	for {
+		Time.Sleep(Time.Millisecond * 1000)
+		println(printBook(orderBook2))
+		println("Price: ", calcPrice(orderBook2))
+		predict := n.Predict(formatBook(orderBook2))
+		println("Predict: ", predict[0])
+
+		if i++; i >= 5 {
+			break
+		}
+	}
+}
+
+// todo func formatBook(b OrderBook) ([20]float64 plain) {
+func formatBook(b OrderBook) []float64 {
+	plain := make([]float64, 10)
+	for pos, i := range []int8{-5, -4, -3, -2, -1, 1, 2, 3, 4, 5} {
+		plain[pos] = b[i].Price
+		// plain[pos + 1] = b[i].Size
+	}
+	return plain
+}
+
+func calcPrice(b OrderBook) float64 { // todo or ref?
+	return (b[-1].Price + b[1].Price) / 2
 }
