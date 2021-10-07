@@ -1,5 +1,7 @@
 package main
 
+// просто сбор свечей в файлик
+
 import (
 	Json "encoding/json"
 	Fmt "fmt"

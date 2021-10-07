@@ -1,13 +1,12 @@
 package main
 
-// добавтиь цикл для переподключения сокетов загрузки стаканов
+// собирать стаканы с N бирж, мониторить и записывать промежутки (gaps)
+// в качестве интерфейса — бот в телеграм @tvconnector_bot
+// сервер: 128mb за натом
 
-
-// в параллельном процессе без блокировок обновлять цену каждую секунду
-// цену записывать в кэш, в некое хранилишие по типу рэдиса
-// структура под запись разных значений... как лучше всего парсить JSON сразу в структуру?
-// но рэдис слишком дорог, нужна своя штука тут
-// прикрутить хуки телеги
+// текущие недостатки:
+//  - нужно было сразу использовать прослойку (но там мало доки) и сравнивать хотя бы 10 бирж
+//  - меньше копипасты, больше интерфейсов
 
 import (
 	Json "encoding/json"
@@ -31,17 +30,17 @@ import (
 var usd float32
 
 const ticker = "https://blockchain.info/ticker"
+const binanceSocket = "wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms"
+const bitfinexSocket = "wss://api.bitfinex.com/ws/2"
+
+const minGap = 0.23
+const minGapFind = 0.1
 
 func main() {
-	const minGap = 0.23
-
 	go updateBook1()
 	go updateBook2()
 	go updateTicket()
-	go findGap(minGap)
-	// ml()
-	// return
-	// printBooks()
+	go findGap(minGapFind)
 
 	token := Os.Getenv("TELEGRAM")
 
@@ -57,7 +56,7 @@ func main() {
 	}
 
 	b.Handle("/start", func(m *Tg.Message) {
-		b.Send(m.Sender, "My first bot on go. Try to use /gap /btc /book")
+		b.Send(m.Sender, "My first bot on go. Try to use /gap /gaps /btc /top")
 	})
 
 	b.Handle("/btc", func(m *Tg.Message) {
@@ -73,20 +72,30 @@ func main() {
 		}
 	})
 
+	// todo make `/gaps 0.222`
 	b.Handle("/gaps", func(m *Tg.Message) {
+		minGapParam := minGap
+
 		if len(caughtGaps) > 0 {
-			max := 10
-			b.Send(m.Sender, "I found "+Fmt.Sprintf("%v", len(caughtGaps))+" gaps: ")
-			for i, s := range caughtGaps {
-				time := Time.Unix(int64(i), 0)
-				show := time.Format(Time.RFC3339) + "\n" + s
-				b.Send(m.Sender, show)
-				if max--; max < 0 {
-					break
+			maxLines := 10
+			b.Send(m.Sender, Fmt.Sprintf("I found %v gaps, show > %.2f: ", len(caughtGaps), minGapParam))
+			for _, s := range caughtGaps {
+				if s.Gap > minGapParam {
+					show := Fmt.Sprintf(
+						"Time: %v\nGap: %.2f\n<b>Bitfinex:</b>\n<pre>%v</pre>\n\n<b>Binance:</b>\n<pre>%v</pre>",
+						s.Date.Format(Time.RFC3339),
+						s.Gap,
+						printBook(orderBook1),
+						printBook(orderBook2),
+					)
+					b.Send(m.Sender, show)
+					if maxLines--; maxLines < 0 {
+						break
+					}
 				}
 			}
 		} else {
-			b.Send(m.Sender, "No gaps :-(")
+			b.Send(m.Sender, Fmt.Sprintf("No gaps for %.2f :-(", minGap))
 		}
 	})
 
@@ -102,26 +111,13 @@ func main() {
 		}
 	})
 
-	b.Handle("/book", func(m *Tg.Message) {
-		gap1 := (orderBook1[1].Price/orderBook1[-1].Price)*100 - 100.0
-		log := Fmt.Sprintf("%.0f %.0f %.0f > %.2f < %.0f %.0f %.0f",
-			orderBook1[-3].Price,
-			orderBook1[-2].Price,
-			orderBook1[-1].Price,
-			gap1,
-			orderBook1[1].Price,
-			orderBook1[2].Price,
-			orderBook1[3].Price)
-		b.Send(m.Sender, log)
-	})
-
 	b.Start()
 }
 
 type price struct {
 	Symbol string `json:"symbol"`
-	symbol string // hm... wtw?
-	Last15 string // error... `json:"15m"`
+	symbol string // todo hm... wtw?
+	Last15 string // todo error... `json:"15m"`
 	Buy    float32
 	Sell   float32
 	Last   float32
@@ -157,7 +153,6 @@ func updateTicket() {
 		}
 
 		usd = result["USD"].Last
-		// Log.Println("Updated price", usd)
 	}
 }
 
@@ -169,7 +164,13 @@ type OrderBook map[int8]Order
 
 var orderBook1 = make(map[int8]Order)   // bitfinex
 var orderBook2 = make(map[int8]Order)   // binance
-var caughtGaps = make(map[int32]string) // unix:event
+type CaughtGap struct {
+	Gap    float64
+	Date   Time.Time
+	First  OrderBook
+	Second OrderBook
+}
+var caughtGaps = make(map[int32]CaughtGap) // unix:event
 
 func findGap(minGap float64) {
 	if minGap < 0.001 {
@@ -193,40 +194,9 @@ func findGap(minGap float64) {
 			println("Gap (first version!):")
 			println(Fmt.Sprintf("%.2f%%", gap))
 
-			log := Fmt.Sprintf("Gap: %.2f%%", gap) + "\nBitfinex:\n" + printBook(orderBook1) + "\nBinance:\n" + printBook(orderBook2)
-			caughtGaps[int32(currentTime.Unix())] = log
+			// todo how to copy struct?
+			caughtGaps[int32(currentTime.Unix())] = CaughtGap{gap, currentTime, orderBook1, orderBook2}
 		}
-	}
-}
-
-func printBooks() {
-	for {
-		Time.Sleep(Time.Second * 5)
-
-		/*
-			gap1 := math.Abs((orderBook1[1].Price / orderBook1[-1].Price) * 100 - 100.0)
-			Log.Printf("Bitfinex:   %.2f %.2f %.2f %.2f %.2f > %.2f < %.2f %.2f %.2f %.2f %.2f",
-				orderBook1[-5].Price,
-				orderBook1[-4].Price,
-				orderBook1[-3].Price,
-				orderBook1[-2].Price,
-				orderBook1[-1].Price,
-				gap1,
-				orderBook1[1].Price,
-				orderBook1[2].Price,
-				orderBook1[3].Price,
-				orderBook1[4].Price,
-				orderBook1[5].Price)
-		*/
-
-		println("Bitfinex:")
-		println(printBook(orderBook1))
-
-		println("Binance:")
-		println(printBook(orderBook2))
-
-		println("Gap (first version!):")
-		println(Fmt.Sprintf("%.2f%%", calcGap(orderBook1, orderBook2)))
 	}
 }
 
@@ -255,8 +225,8 @@ func calcGap(book1 map[int8]Order, book2 map[int8]Order) float64 {
 // bitfinex
 func updateBook1() {
 	var wsDialer Ws.Dialer
-	for { // redial todo как это сделать более красиво с этом wsDealler
-		wsConn, _, err := wsDialer.Dial("wss://api.bitfinex.com/ws/2", nil)
+	for { // todo redial как это сделать более красиво с этом wsDealler
+		wsConn, _, err := wsDialer.Dial(bitfinexSocket, nil)
 		if err != nil {
 			println(err.Error())
 			continue
@@ -324,12 +294,10 @@ func updateBook1() {
 
 // binance
 func updateBook2() {
-	const socket = "wss://stream.binance.com:9443/ws/btcusdt@depth10@100ms"
+	var wsDialer Ws.Dialer // todo howto interfaces
 
-	var wsDialer Ws.Dialer // howto interfaces
-
-	for { // redial
-		wsConn, _, err := wsDialer.Dial(socket, nil)
+	for { // todo redial
+		wsConn, _, err := wsDialer.Dial(binanceSocket, nil)
 		if err != nil {
 			println(err.Error())
 			continue
@@ -378,101 +346,4 @@ func updateBook2() {
 			}
 		}
 	}
-}
-
-/*
-пока алго такой вот:
- - 20points * 5values = 100 inputs - 1 output
- - 100, 100, 100, 100
-
-зачем нормализовать?
- - чтобы можно было применять нейронку к разным парам
-
-
-
-*/
-
-func ml() {
-	n := Deep.NewNeural(&Deep.Config{
-		/* Input dimensionality */
-		Inputs: 100,
-		/* Two hidden layers consisting of two neurons each, and a single output */
-		Layout: []int{100, 100, 1}, // 1000*1000 -> 1
-		/* Activation functions: Sigmoid, Tanh, ReLU, Linear */
-		Activation: Deep.ActivationSigmoid,
-		/* Determines output layer activation & loss function:
-		ModeRegression: linear outputs with MSE loss
-		ModeMultiClass: softmax output with Cross Entropy loss
-		ModeMultiLabel: sigmoid output with Cross Entropy loss
-		ModeBinary: sigmoid output with binary CE loss */
-		Mode: Deep.ModeBinary,
-		/* Weight initializers: {deep.NewNormal(μ, σ), deep.NewUniform(μ, σ)} */
-		Weight: Deep.NewNormal(1.0, 0.0),
-		/* Apply bias */
-		Bias: true,
-	})
-
-	// params: learning rate, momentum, alpha decay, nesterov
-	optimizer := Training.NewSGD(0.05, 0.1, 1e-6, true)
-	// params: optimizer, verbosity (print stats at every 50th iteration)
-	trainer := Training.NewTrainer(optimizer, 100)
-	// trainer := Training.NewBatchTrainer(optimizer, 50, 200, 4)
-
-	Time.Sleep(Time.Second * 5) // wait data...
-
-	prev := make(OrderBook) // prev version
-	max := 25 // points
-	examples := make(Training.Examples, max)
-
-	// train cycle
-
-	Log.Println("Collect data...")
-
-	for k, v := range orderBook2 {
-		prev[k] = v
-	}
-
-	i := 0
-	for {
-		Time.Sleep(Time.Millisecond * 1000)
-		nextPrice := calcPrice(orderBook2)
-		examples[i] = Training.Example{Input: formatBook(prev), Response: []float64{nextPrice}}
-		if i++; i >= max {
-			break
-		}
-		Log.Println("Diff:", nextPrice - calcPrice(prev))
-		for k, v := range orderBook2 {
-			prev[k] = v
-		}
-	}
-
-	training, heldout := examples.Split(0.5)
-	trainer.Train(n, training, heldout, 1000) // training, validation, iterations
-
-	i = 0
-	for {
-		Time.Sleep(Time.Millisecond * 1000)
-		println(printBook(orderBook2))
-		println("Price: ", calcPrice(orderBook2))
-		predict := n.Predict(formatBook(orderBook2))
-		println("Predict: ", predict[0])
-
-		if i++; i >= 5 {
-			break
-		}
-	}
-}
-
-// todo func formatBook(b OrderBook) ([20]float64 plain) {
-func formatBook(b OrderBook) []float64 {
-	plain := make([]float64, 10)
-	for pos, i := range []int8{-5, -4, -3, -2, -1, 1, 2, 3, 4, 5} {
-		plain[pos] = b[i].Price
-		// plain[pos + 1] = b[i].Size
-	}
-	return plain
-}
-
-func calcPrice(b OrderBook) float64 { // todo or ref?
-	return (b[-1].Price + b[1].Price) / 2
 }
